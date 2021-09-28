@@ -3,8 +3,11 @@
 namespace App\Http\Livewire;
 
 use App\Enums\BoxIdentifier;
+use App\Enums\CheckingMethod;
 use App\Enums\ReservationStatus;
 use App\Models\Reservation;
+use App\Models\Transaction;
+use Illuminate\Support\Arr;
 use Livewire\Component;
 
 class ReserveBoxButton extends Component
@@ -26,7 +29,7 @@ class ReserveBoxButton extends Component
     {
         return view('livewire.reserve-box-button', [
             'transaction' => $this->transactionObject,
-            'box' => $this->boxIdentifier,
+            'box'         => $this->boxIdentifier,
         ]);
     }
 
@@ -42,25 +45,23 @@ class ReserveBoxButton extends Component
 
     public function checkForTransaction()
     {
-        if(!$this->modalIsOpen) {
+        if (!$this->modalIsOpen) {
             return;
         }
-        $address  = config('payforspace.elrond_api') . 'address/' . config('payforspace.elrond_wallet_address') . '/transactions';
-        $response = \Http::get($address);
 
-        $transactions = collect($response['data']['transactions']);
-
-        $theOne = $transactions->first(fn($el) => $el['data'] && str_contains(base64_decode($el['data']), $this->transactionDescription));
+        $theOne = $this->getTheOne();
 
         if ($theOne) {
-            $price = bcdiv($theOne['value'], 1000000000000000000, 2);
-            if ($price == bcdiv($this->reservation->amount, 100, 2) && $theOne['receiver'] == config('payforspace.elrond_wallet_address')) {
-                $this->reservation->transaction = $theOne;
-                $this->reservation->status = ReservationStatus::confirmed()->value;
-                $this->reservation->active_from = now();
+            $price    = bcdiv($theOne['value'], 1000000000000000000, 2);
+            $receiver = config('payforspace.checking_method')
+            == CheckingMethod::local()->value ? Arr::get($theOne->object, 'transaction.receiver') : $theOne['receiver'];
+            if ($price == bcdiv($this->reservation->amount, 100, 2) && $receiver == config('payforspace.elrond_wallet_address')) {
+                $this->reservation->transaction  = $theOne;
+                $this->reservation->status       = ReservationStatus::confirmed()->value;
+                $this->reservation->active_from  = now();
                 $this->reservation->active_until = now()->addDays($this->reservation->number_of_days);
                 $this->reservation->save();
-                $this->transactionObject = $theOne;
+                $this->transactionObject = config('payforspace.checking_method') == CheckingMethod::local()->value ? $theOne->object : $theOne;
             }
         }
     }
@@ -81,17 +82,49 @@ class ReserveBoxButton extends Component
 
         $reservation = new Reservation([
             'reservation_started_at' => now(),
-            'status' => ReservationStatus::pending()->value,
-            'number_of_days' => $this->number_of_days,
-            'amount' => bcmul($this->amountToPay(), 100),
-            'box_identifier' => $this->boxIdentifier->value,
+            'status'                 => ReservationStatus::pending()->value,
+            'number_of_days'         => $this->number_of_days,
+            'amount'                 => bcmul($this->amountToPay(), 100),
+            'box_identifier'         => $this->boxIdentifier->value,
         ]);
 
         auth()->user()->reservations()->save($reservation);
 
         $this->transactionDescription = $reservation->identifier();
 
-        $this->confirmed = true;
+        $this->confirmed   = true;
         $this->reservation = $reservation;
+    }
+
+    /**
+     * @return mixed
+     */
+    protected function getTheOne(): mixed
+    {
+        if (config('payforspace.checking_method') === CheckingMethod::local()->value) {
+            return $this->getLocalTransaction();
+        }
+        return $this->getGatewayTransaction();
+    }
+
+    protected function getLocalTransaction(): null|Transaction
+    {
+        return Transaction::query()
+            ->where('data', 'like', $this->transactionDescription . '%')
+            ->first();
+    }
+
+    /**
+     * @return mixed
+     */
+    protected function getGatewayTransaction(): mixed
+    {
+        $address  = config('payforspace.elrond_gateway') . 'address/' . config('payforspace.elrond_wallet_address') . '/transactions';
+        $response = \Http::get($address);
+
+        $transactions = collect($response['data']['transactions']);
+
+        $theOne = $transactions->first(fn($el) => $el['data'] && str_contains(base64_decode($el['data']), $this->transactionDescription));
+        return $theOne;
     }
 }
